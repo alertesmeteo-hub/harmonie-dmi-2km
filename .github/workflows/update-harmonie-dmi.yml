@@ -27,7 +27,11 @@ concurrency:
 jobs:
   update:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # L'API DMI est mutualisee et repond parfois "429 Server is busy" ;
+    # avec ~140 points x 2 requetes et un budget de nouvelles tentatives
+    # poli (backoff jusqu'a 30s), une passe complete peut prendre du temps
+    # les jours ou l'API est tres sollicitee.
+    timeout-minutes: 45
 
     steps:
       - name: Récupérer le dépôt
