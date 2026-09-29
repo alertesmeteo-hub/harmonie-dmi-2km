@@ -1,0 +1,87 @@
+name: Mise à jour HARMONIE DMI (2 km, département 66)
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Retraiter même si le script pense que le run DMI est déjà publié"
+        type: boolean
+        default: false
+  schedule:
+    # Les heures planifiées par GitHub sont toujours en UTC et sont
+    # best-effort (retards de plusieurs heures déjà observés sur d'autres
+    # workflows de ce projet). Un passage horaire ne coûte presque rien :
+    # le script vérifie d'abord /instances (appel léger) avant de
+    # récupérer les prévisions complètes, donc la plupart des passages ne
+    # font rien tant que le DMI n'a pas publié un nouveau run (00/03/06/
+    # 09/12/15/18/21Z, disponible ~2h30-3h plus tard).
+    - cron: "20 * * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-harmonie-dmi
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Récupérer le dépôt
+        uses: actions/checkout@v7
+
+      - name: Installer Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Récupérer les prévisions DMI et construire le département 66
+        run: |
+          node scripts/update-harmonie-dmi.mjs \
+            --output-dir build/national \
+            --current-metadata-url \
+            "https://raw.githubusercontent.com/${{ github.repository }}/data/index.json" \
+            ${{ inputs.force && '--force' || '' }}
+
+      - name: Vérifier la publication
+        run: |
+          node - <<'JS'
+          const fs = require("fs");
+          const path = "build/national/index.json";
+          if (!fs.existsSync(path)) {
+            console.log("Rien à publier (run déjà à jour).");
+            process.exit(0);
+          }
+          const index = JSON.parse(fs.readFileSync(path, "utf-8"));
+          if (index.status !== "ok") throw new Error("status != ok");
+          if (!index.departments["66"]) throw new Error("département 66 manquant");
+          const dep = JSON.parse(fs.readFileSync("build/national/departements/66.json", "utf-8"));
+          if (!dep.points.length || !dep.communes.length || !dep.forecast.length) {
+            throw new Error("fichier département 66 incomplet");
+          }
+          console.log(
+            `Validation OK : ${dep.points.length} points, ${dep.communes.length} communes, ` +
+            `${dep.forecast.length} échéances, run ${index.model.run_time}`
+          );
+          JS
+
+      - name: Publier sur la branche data
+        if: hashFiles('build/national/index.json') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPOSITORY: ${{ github.repository }}
+        run: |
+          publish_dir="$(mktemp -d)"
+          cp -a build/national/. "$publish_dir/"
+          touch "$publish_dir/.nojekyll"
+          cd "$publish_dir"
+          git init -b data
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add --all
+          git commit -m "Mise à jour HARMONIE DMI 66 $(date -u +'%Y-%m-%d %H:%M UTC')"
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GH_REPOSITORY}.git"
+          git push --force origin data
