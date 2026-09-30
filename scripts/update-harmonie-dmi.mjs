@@ -103,8 +103,12 @@ function parseArgs(argv) {
     outputDir: "build/national",
     currentMetadataUrl: "",
     force: false,
-    gridSpacingDeg: 0.055, // ~6 km en latitude a cette latitude
-    maxPoints: 140,
+    // Grille volontairement plus grossiere (~40 points au lieu de 114) : l'API DMI est
+    // durablement saturee (HTTP 429) sur ce point d'acces, une passe complete a 114 points
+    // n'a jamais reussi meme avec un timeout de 120 min (60/114 au mieux, avec des echecs
+    // croissants). Moins de points = moins de requetes = plus de chances de reussite.
+    gridSpacingDeg: 0.09, // ~10 km en latitude a cette latitude
+    maxPoints: 40,
     concurrency: 1,
     pacingMs: 400,
   };
