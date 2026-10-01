@@ -51,6 +51,9 @@ jobs:
             "https://raw.githubusercontent.com/${{ github.repository }}/data/index.json" \
             ${{ inputs.force && '--force' || '' }}
 
+      - name: Générer les cartes (département 66 uniquement)
+        run: node scripts/generate-harmonie-dmi-maps.mjs --output-dir build/national
+
       - name: Vérifier la publication
         run: |
           node - <<'JS'
