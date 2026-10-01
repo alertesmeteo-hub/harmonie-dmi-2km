@@ -103,15 +103,15 @@ function parseArgs(argv) {
     outputDir: "build/national",
     currentMetadataUrl: "",
     force: false,
-    // Grille intermediaire (~80 points, ~7 km) : l'API DMI est durablement saturee (HTTP 429)
-    // sur ce point d'acces, une passe complete a 114-140 points (grille native ~6 km) n'a jamais
-    // reussi meme avec un timeout de 120 min (60/114 au mieux, avec des echecs croissants). On
-    // double quand meme la resolution par rapport aux ~40 points precedents (ca passait sans
-    // souci), avec un pacing un peu plus genereux pour limiter le risque de 429.
-    gridSpacingDeg: 0.065, // ~7 km en latitude a cette latitude
-    maxPoints: 80,
+    // Grille volontairement plus grossiere (~40 points) : l'API DMI est durablement saturee
+    // (HTTP 429) sur ce point d'acces. Deux tentatives d'augmentation ont echoue : 114-140 points
+    // (grille native ~6 km, jamais reussi meme avec 120 min de timeout) et ~80 points a 0,065 deg
+    // (echec confirme le 2026-10-01 : 36/63 points en echec apres 1h53, voir run Github Actions
+    // 36832056488). Rester a ~40 points est la seule configuration fiable trouvee a ce jour.
+    gridSpacingDeg: 0.09, // ~10 km en latitude a cette latitude
+    maxPoints: 40,
     concurrency: 1,
-    pacingMs: 500,
+    pacingMs: 400,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
