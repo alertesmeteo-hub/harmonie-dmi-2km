@@ -19,6 +19,9 @@ const WIDTH = 360;
 const HEIGHT = 300;
 const BUFFER_DEG = 0.06;
 const NEIGHBOURS = 8;
+// Couches a paliers nets (pluie) : rendues 3x plus fines, sinon les marches de
+// couleur apparaissent en escalier des qu'on zoome sur la carte.
+const DISCRETE_SCALE = 3;
 
 const TEMP_STOPS = [
   [-25, "#7209b7"], [-15, "#3a0ca3"], [-5, "#4361ee"], [0, "#4cc9f0"], [5, "#2ec4b6"],
@@ -101,35 +104,35 @@ function colorForValue(value, stops, discrete) {
 
 // Pour chaque pixel : indices et poids IDW des NEIGHBOURS points les plus
 // proches, calcules une seule fois puis reutilises pour chaque couche/echeance.
-function buildInterpolation(bounds, points, lonScale) {
-  const n = WIDTH * HEIGHT;
+function buildInterpolation(bounds, points, lonScale, W, H) {
+  const n = W * H;
   const k = Math.min(NEIGHBOURS, points.length);
   const indexes = new Int16Array(n * k);
   const weights = new Float32Array(n * k);
   const dist = new Float64Array(points.length);
   const order = new Array(points.length);
-  for (let y = 0; y < HEIGHT; y++) {
-    const lat = bounds.north - (y / (HEIGHT - 1)) * (bounds.north - bounds.south);
-    for (let x = 0; x < WIDTH; x++) {
-      const lon = bounds.west + (x / (WIDTH - 1)) * (bounds.east - bounds.west);
+  for (let y = 0; y < H; y++) {
+    const lat = bounds.north - (y / (H - 1)) * (bounds.north - bounds.south);
+    for (let x = 0; x < W; x++) {
+      const lon = bounds.west + (x / (W - 1)) * (bounds.east - bounds.west);
       for (let i = 0; i < points.length; i++) {
         order[i] = i;
         dist[i] = Math.hypot((lon - points[i][0]) * lonScale, lat - points[i][1]);
       }
       order.sort((a, b) => dist[a] - dist[b]);
-      const o = (y * WIDTH + x) * k;
+      const o = (y * W + x) * k;
       for (let j = 0; j < k; j++) {
         indexes[o + j] = order[j];
         weights[o + j] = 1 / Math.max(dist[order[j]] ** 2, 1e-6);
       }
     }
   }
-  return { indexes, weights, k };
+  return { indexes, weights, k, W, H };
 }
 
 function interpolate(interp, values) {
-  const { indexes, weights, k } = interp;
-  const n = WIDTH * HEIGHT;
+  const { indexes, weights, k, W, H } = interp;
+  const n = W * H;
   const out = new Float32Array(n).fill(NaN);
   for (let p = 0; p < n; p++) {
     let sw = 0;
@@ -191,8 +194,8 @@ function encodePng(width, height, rgba) {
   return Buffer.concat([signature, chunk("IHDR", ihdr), chunk("IDAT", idat), chunk("IEND", Buffer.alloc(0))]);
 }
 
-function renderField(field, layer) {
-  const rgba = Buffer.alloc(WIDTH * HEIGHT * 4);
+function renderField(field, layer, W, H) {
+  const rgba = Buffer.alloc(W * H * 4);
   const opacity = layer.opacity ?? 224;
   for (let p = 0; p < field.length; p++) {
     const value = field[p];
@@ -241,7 +244,8 @@ async function main() {
   const lonScale = Math.cos(((bounds.south + bounds.north) / 2) * (Math.PI / 180));
 
   const points = dep.points.map((p) => [p[2], p[1]]); // [lon, lat]
-  const interp = buildInterpolation(bounds, points, lonScale);
+  const interpFine = buildInterpolation(bounds, points, lonScale, WIDTH, HEIGHT);
+  const interpSharp = buildInterpolation(bounds, points, lonScale, WIDTH * DISCRETE_SCALE, HEIGHT * DISCRETE_SCALE);
 
   const steps = dep.forecast.map(([isoTime], t) => ({ lead_hour: t, valid_time: isoTime, files: {} }));
   const usedLayers = [];
@@ -249,6 +253,7 @@ async function main() {
   for (const layer of LAYERS) {
     const col = dep.columns.values.indexOf(layer.column);
     if (col < 0) continue;
+    const interp = layer.discrete ? interpSharp : interpFine;
     const dir = path.join(outputDir, "maps", layer.key);
     await mkdir(dir, { recursive: true });
     const running = new Array(points.length).fill(0);
@@ -263,9 +268,9 @@ async function main() {
         });
       }
       if (!values.some((v) => typeof v === "number")) continue;
-      const rgba = renderField(interpolate(interp, values), layer);
+      const rgba = renderField(interpolate(interp, values), layer, interp.W, interp.H);
       const fileName = `${String(t).padStart(3, "0")}.png`;
-      await writeFile(path.join(dir, fileName), encodePng(WIDTH, HEIGHT, rgba));
+      await writeFile(path.join(dir, fileName), encodePng(interp.W, interp.H, rgba));
       steps[t].files[layer.key] = `maps/${layer.key}/${fileName}`;
       wrote++;
     }
