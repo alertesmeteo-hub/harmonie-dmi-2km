@@ -1,0 +1,52 @@
+name: Regénérer les cartes HARMONIE DMI (sans appel DMI)
+
+# Recalcule uniquement les cartes à partir du dernier département 66 déjà
+# publié sur la branche data : utile quand le script de cartes change, sans
+# attendre ni relancer la récupération (lente, sujette aux 429) auprès du DMI.
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+    paths:
+      - scripts/generate-harmonie-dmi-maps.mjs
+      - .github/workflows/update-harmonie-dmi-maps.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-harmonie-dmi
+  cancel-in-progress: false
+
+jobs:
+  maps:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Récupérer le dépôt
+        uses: actions/checkout@v7
+
+      - name: Installer Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Récupérer les données publiées (branche data)
+        run: git clone --depth 1 --branch data "https://github.com/${{ github.repository }}.git" build/national
+
+      - name: Générer les cartes
+        run: node scripts/generate-harmonie-dmi-maps.mjs --output-dir build/national
+
+      - name: Publier sur la branche data
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPOSITORY: ${{ github.repository }}
+        run: |
+          cd build/national
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add --all
+          git diff --cached --quiet && { echo "Rien à publier."; exit 0; }
+          git commit -m "Cartes HARMONIE DMI 66 $(date -u +'%Y-%m-%d %H:%M UTC')"
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GH_REPOSITORY}.git"
+          git push origin data
