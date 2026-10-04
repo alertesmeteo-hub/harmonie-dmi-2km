@@ -453,11 +453,14 @@ async function main() {
   });
   log(`Recuperation terminee en ${((Date.now() - startedAt) / 1000).toFixed(0)}s (${failedCount}/${gridPoints.length} points en echec).`);
 
-  if (failedCount > gridPoints.length * 0.3) {
+  // Un jeu partiel (>= 40 % des points) vaut mieux qu'un run ancien : les communes des points manquants
+  // reprennent le point le plus proche (nearestPointIndex ci-dessous). En dessous, le DMI est vraiment HS.
+  if (failedCount > gridPoints.length * 0.6) {
     throw new Error(
-      `Trop de points en echec (${failedCount}/${gridPoints.length}) - le DMI semble indisponible, abandon plutot que de publier un jeu de donnees incomplet.`
+      `Trop de points en echec (${failedCount}/${gridPoints.length}) - le DMI semble indisponible, abandon plutot que de publier un jeu de donnees trop incomplet.`
     );
   }
+  if (failedCount > 0) log(`Publication partielle : ${gridPoints.length - failedCount}/${gridPoints.length} points recuperes.`);
 
   // On ne conserve que les points effectivement recuperes, et on
   // renumerote model_index en consequence (0..n-1 dans l'ordre conserve).
