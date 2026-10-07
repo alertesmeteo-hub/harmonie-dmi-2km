@@ -43,6 +43,13 @@ jobs:
         with:
           node-version: "22"
 
+      - name: Restaurer les points DMI déjà récupérés (run en cours)
+        uses: actions/cache/restore@v4
+        with:
+          path: .cache/dmi
+          key: dmi-points-${{ github.run_id }}
+          restore-keys: dmi-points-
+
       - name: Récupérer les prévisions DMI et construire le département 66
         run: |
           node scripts/update-harmonie-dmi.mjs \
@@ -50,6 +57,13 @@ jobs:
             --current-metadata-url \
             "https://raw.githubusercontent.com/${{ github.repository }}/data/index.json" \
             ${{ inputs.force && '--force' || '' }}
+
+      - name: Conserver les points DMI récupérés (même en cas d'échec)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .cache/dmi
+          key: dmi-points-${{ github.run_id }}
 
       - name: Générer les cartes (département 66 uniquement)
         run: node scripts/generate-harmonie-dmi-maps.mjs --output-dir build/national

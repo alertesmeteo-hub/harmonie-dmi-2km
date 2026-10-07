@@ -112,6 +112,12 @@ function parseArgs(argv) {
     maxPoints: 40,
     concurrency: 1,
     pacingMs: 400,
+    // Points deja recuperes pour le run en cours : conserves d'une tentative a l'autre (cache du workflow),
+    // pour que chaque passage ne reprenne que les points manquants au lieu de tout redemander a un DMI sature.
+    cacheDir: ".cache/dmi",
+    // Apres ce nombre de points consecutifs abandonnes (7 essais chacun), l'API est consideree saturee :
+    // on s'arrete (le cache est conserve) plutot que d'attendre plus d'une heure pour rien.
+    maxConsecutiveFailures: 4,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -122,6 +128,8 @@ function parseArgs(argv) {
     else if (a === "--max-points") args.maxPoints = Number(argv[++i]);
     else if (a === "--concurrency") args.concurrency = Number(argv[++i]);
     else if (a === "--pacing-ms") args.pacingMs = Number(argv[++i]);
+    else if (a === "--cache-dir") args.cacheDir = argv[++i];
+    else if (a === "--max-consecutive-failures") args.maxConsecutiveFailures = Number(argv[++i]);
     else throw new Error(`Argument inconnu : ${a}`);
   }
   return args;
@@ -437,9 +445,33 @@ async function main() {
   log(`Interrogation du DMI pour ${gridPoints.length} points (endpoint /position, ${DMI_PARAMETERS.length} parametres)...`);
   const startedAt = Date.now();
   let failedCount = 0;
+
+  // Cache des points deja recuperes pour CE run (identifie par l'instance DMI).
+  const cacheFile = path.join(args.cacheDir, "points.json");
+  let cache = { instanceId, points: {} };
+  try {
+    const saved = JSON.parse(await readFile(cacheFile, "utf-8"));
+    if (saved.instanceId === instanceId && saved.points) cache = saved;
+  } catch {
+    // pas de cache : premiere tentative pour ce run
+  }
+  await mkdir(args.cacheDir, { recursive: true });
+  const cachedAtStart = Object.keys(cache.points).length;
+  if (cachedAtStart) log(`Cache : ${cachedAtStart} point(s) deja recupere(s) pour ce run, ils ne sont pas redemandes.`);
+  let consecutiveFailures = 0;
+
   const fetchedRaw = await mapWithConcurrency(gridPoints, args.concurrency, async ([lon, lat], i) => {
+    const key = `${lon},${lat}`;
+    if (cache.points[key]) return cache.points[key];
+    if (consecutiveFailures >= args.maxConsecutiveFailures) {
+      failedCount++;
+      return null;
+    }
     try {
       const result = await fetchPoint(lon, lat, args.pacingMs);
+      consecutiveFailures = 0;
+      cache.points[key] = result;
+      await writeFile(cacheFile, JSON.stringify(cache), "utf-8");
       if (args.pacingMs > 0) await sleep(args.pacingMs);
       if ((i + 1) % 20 === 0 || i === gridPoints.length - 1) {
         log(`  ${i + 1}/${gridPoints.length} points traites (${failedCount} echecs jusqu'ici)...`);
@@ -447,7 +479,11 @@ async function main() {
       return result;
     } catch (error) {
       failedCount++;
-      log(`  Point ${i} (${lon},${lat}) abandonne apres tous les essais : ${error.message}`);
+      consecutiveFailures++;
+      log(`  Point ${i} (${lon},${lat}) abandonne apres tous les essais : ${error.message.slice(0, 160)}`);
+      if (consecutiveFailures >= args.maxConsecutiveFailures) {
+        log(`  ${consecutiveFailures} points de suite en echec : API DMI saturee, arret (les points deja recuperes sont conserves pour le prochain passage).`);
+      }
       return null;
     }
   });
