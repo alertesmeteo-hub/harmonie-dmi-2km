@@ -63,6 +63,17 @@ jobs:
               break
             fi
             if [ "$attempt" -eq 3 ] || ! grep -qiE 'RemoteDisconnected|Connection(Error|Reset|refused| aborted)|IncompleteRead|ReadTimeout|ConnectTimeout|ChunkedEncodingError|ProtocolError|Max retries exceeded|Temporary failure in name resolution|Name or service not known|SSLError|HTTP ?(Error)?:? ?(429|500|502|503|504)|(429|502|503|504) (Too Many|Bad Gateway|Service Unavailable|Gateway Time|Server)|Server is busy|ECONNRESET|ETIMEDOUT|EAI_AGAIN|fetch failed|socket hang up|timed out|Read timed' "$RUNNER_TEMP/tentative.log"; then
+              # DMI saturé (429) jusqu'au bout : tant que les données publiées ont moins de 6 h, simple avertissement
+              # (le passage suivant reprend avec les points en cache) ; au-delà, échec pour alerter.
+              if grep -qiE 'HTTP 429|Server is busy|Too Many Requests' "$RUNNER_TEMP/tentative.log"; then
+                age_h=$(curl -fsS "https://raw.githubusercontent.com/${{ github.repository }}/data/index.json" \
+                  | node -e 'let s="";process.stdin.on("data",(d)=>(s+=d)).on("end",()=>{const g=Date.parse(JSON.parse(s).generated_at);console.log(Number.isFinite(g)?Math.floor((Date.now()-g)/3.6e6):999)})' \
+                  || echo 999)
+                if [ "$age_h" -lt 6 ]; then
+                  echo "::warning::API DMI saturée (429) : données publiées il y a ${age_h} h, nouvel essai au prochain passage."
+                  exit 0
+                fi
+              fi
               echo "::error::Échec (tentative $attempt)"
               exit 1
             fi
