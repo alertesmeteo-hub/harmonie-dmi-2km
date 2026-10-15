@@ -23,29 +23,33 @@ domaine couvrant l'Islande jusqu'a l'Espagne (bbox `[-43.17, 37.69, 40.07,
   `/collections/harmonie_dini_sf/instances` (le plus recent des runs
   listes) plutot que de deviner l'heure : c'est fiable et tres bon marche
   (une seule requete legere).
-- Les donnees sont recuperees via l'endpoint `/position` (un point a la
-  fois, coordonnees WGS84 `crs84`) : `/cube` (bbox) exige la projection
-  Lambert conique conforme native de ce modele pour DINI/IG, ce qui aurait
-  complique le pipeline pour un gain marginal vu le nombre de points geres
-  ici (quelques centaines tout au plus).
-- L'API est mutualisee et repond parfois `429 Server is busy` : toutes les
-  requetes passent par un backoff exponentiel poli (depart ~2.5s, plafond
-  ~30s, abandon propre apres plusieurs tentatives — voir
-  `fetchWithRetry()` dans le script).
+- Les donnees sont recuperees via l'endpoint `/cube` : **une requete par lot
+  de parametres** (2 lots, limite DMI de 1000 echeances x parametres) renvoie
+  toute la grille native 2 km autour du departement (~70 x 45 mailles). Le
+  `/cube` n'accepte que la projection native (`crs=native`) : Lambert
+  conique conforme tangent a 55,5 N, meridien d'origine -8, sphere de rayon
+  6 371 229 m, **coordonnees en kilometres** (grille 1906 x 1606 au pas de
+  2 km). `versLambert()` / `versLonLat()` font la conversion ; le point de
+  grille renvoye par `/position` pour Perpignan tombe exactement sur un noeud
+  du `/cube`. Il repond en CoverageJSON (`application/prs.coverage+json`).
+- Avant le passage au `/cube`, le pipeline faisait deux requetes `/position`
+  par point : l'API, mutualisee, repondait `429 Server is busy` au bout de
+  quelques dizaines de requetes, d'ou une grille limitee a ~26-40 points.
+  Les 2 requetes restantes passent par un backoff exponentiel poli (depart
+  5 s, plafond 60 s, 14 essais — voir `fetchWithRetry()`), et les lots deja
+  recuperes sont gardes en cache pour le passage suivant.
 
 ## Grille et communes
 
-- Grille reguliere generee a l'interieur (+ quelques km de marge) du
-  polygone du departement 66 (`config/departement-66.geojson`, extrait du
-  depot `harmonie` — IGN Admin Express, licence ouverte Etalab), avec un
-  pas resserre jusqu'a rester sous ~220 points. C'est un sous-echantillon
-  de la grille native 2 km du DMI (chaque point interroge est resolu par
-  l'API au point de grille natif le plus proche) — meme principe que le
-  pipeline KNMI qui n'interroge pas non plus tous les points a 5.5 km.
+- Zone demandee : le rectangle natif qui contient le polygone du departement
+  66 (`config/departement-66.geojson`, extrait du depot `harmonie` — IGN
+  Admin Express, licence ouverte Etalab), plus 4 km de marge.
 - Chaque commune du departement (`config/communes-66.json`, 226 communes,
-  extrait de `communes-france.json` du depot `harmonie`) est rattachee au
-  point de grille le plus proche (`point_id`, index dans le tableau
-  `points` du fichier de sortie).
+  extrait de `communes-france.json` du depot `harmonie`) prend **la maille
+  native 2 km qui la contient** ; une maille partagee par deux communes
+  n'est publiee qu'une fois (`point_id`, index dans le tableau `points` du
+  fichier de sortie). Meme principe que le pipeline AROME (un point par
+  commune).
 
 ## Champs publies
 
@@ -81,7 +85,7 @@ tourne environ toutes les heures (best-effort cote GitHub) :
 
 1. Interroge `/instances` : si le run deja publie sur la branche `data` est
    toujours le plus recent, elle s'arrete la (cout quasi nul).
-2. Sinon, recupere les previsions DMI pour tous les points de grille
+2. Sinon, recupere les previsions DMI de la zone en deux requetes `/cube`
    (`scripts/update-harmonie-dmi.mjs`, Node.js, aucune dependance externe).
 3. Publie `index.json` + `departements/66.json` en ecrasant la branche
    [`data`](../../tree/data) (meme technique que le depot `harmonie` :

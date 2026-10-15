@@ -4,13 +4,16 @@
 //
 // Source : DMI Open Data EDR API, collection "harmonie_dini_sf"
 //   https://opendataapi.dmi.dk/v1/forecastedr/collections/harmonie_dini_sf
-// Gratuite, sans cle API. On interroge l'endpoint /position (point par
-// point, coordonnees WGS84 crs84) : le /cube (bbox) exige la projection
-// Lambert native pour ce modele et complique inutilement le pipeline vu le
-// faible nombre de points necessaires pour un seul departement.
+// Gratuite, sans cle API. On interroge l'endpoint /cube : UNE requete par lot
+// de parametres renvoie toute la grille native 2 km autour du departement
+// (~72 x 49 mailles), au lieu de deux requetes /position par point. Le /cube
+// n'accepte que la projection native (Lambert conique conforme, coordonnees
+// en kilometres) : versLambert()/versLonLat() font la conversion.
 //
-// Cette API est mutualisee et repond parfois "429 Server is busy" : toutes
-// les requetes passent par fetchWithRetry() (backoff exponentiel, poli).
+// Cette API est mutualisee et repond souvent "429 Server is busy" : toutes
+// les requetes passent par fetchWithRetry() (backoff exponentiel, poli). Avec
+// 2 requetes par run (au lieu de ~80 en point par point), la saturation ne
+// bloque plus la publication.
 //
 // Usage :
 //   node scripts/update-harmonie-dmi.mjs \
@@ -27,7 +30,8 @@ const ROOT = path.resolve(__dirname, "..");
 
 const API_BASE = "https://opendataapi.dmi.dk/v1/forecastedr/collections/harmonie_dini_sf";
 const COLLECTION = "harmonie_dini_sf";
-const PIPELINE_VERSION = 1;
+// 2 : grille native 2 km via /cube, une maille par commune (au lieu de ~26 a 40 points /position).
+const PIPELINE_VERSION = 2;
 const USER_AGENT = "alertesmeteo-hub/harmonie-dmi-2km (contact: alertes.meteo@gmail.com)";
 
 // Parametres DMI demandes par point. `geopotential` (sans niveau = ECMWF
@@ -39,14 +43,16 @@ const USER_AGENT = "alertesmeteo-hub/harmonie-dmi-2km (contact: alertes.meteo@gm
 // parametres) depasse 1000 (HTTP 413 "Too many model steps and/or
 // parameters"). Avec ~61-79 echeances, on ne peut pas demander les 17
 // parametres en une fois : ils sont donc repartis en deux lots, chacun
-// recupere par une requete /position distincte pour le meme point.
+// recupere par une requete /cube distincte.
 const DMI_PARAMETER_BATCHES = [
   [
     "temperature-2m",
     "dew-point-temperature-2m",
     "relative-humidity-2m",
-    "wind-speed-10m",
-    "wind-dir-10m",
+    // En crs=native, le /cube refuse wind-speed-10m et wind-dir-10m (calcules seulement pour /position) :
+    // on demande les composantes u et v, dont on tire vitesse et direction (voir ventDepuisUV()).
+    "wind-10m-u",
+    "wind-10m-v",
     "gust-wind-speed-10m",
     "pressure-sealevel",
     "visibility",
@@ -63,7 +69,6 @@ const DMI_PARAMETER_BATCHES = [
     "convective-available-potential-energy",
   ],
 ];
-const DMI_PARAMETERS = DMI_PARAMETER_BATCHES.flat();
 
 // Colonnes publiees dans departements/66.json, dans cet ordre.
 const VALUE_COLUMNS = [
@@ -103,33 +108,19 @@ function parseArgs(argv) {
     outputDir: "build/national",
     currentMetadataUrl: "",
     force: false,
-    // Grille volontairement plus grossiere (~40 points) : l'API DMI est durablement saturee
-    // (HTTP 429) sur ce point d'acces. Deux tentatives d'augmentation ont echoue : 114-140 points
-    // (grille native ~6 km, jamais reussi meme avec 120 min de timeout) et ~80 points a 0,065 deg
-    // (echec confirme le 2026-10-01 : 36/63 points en echec apres 1h53, voir run Github Actions
-    // 36832056488). Rester a ~40 points est la seule configuration fiable trouvee a ce jour.
-    gridSpacingDeg: 0.09, // ~10 km en latitude a cette latitude
-    maxPoints: 40,
-    concurrency: 1,
-    pacingMs: 400,
-    // Points deja recuperes pour le run en cours : conserves d'une tentative a l'autre (cache du workflow),
-    // pour que chaque passage ne reprenne que les points manquants au lieu de tout redemander a un DMI sature.
+    // Lots /cube deja recuperes pour le run en cours : conserves d'une tentative a l'autre (cache du workflow),
+    // pour qu'un passage interrompu par un DMI sature ne redemande que le lot manquant.
     cacheDir: ".cache/dmi",
-    // Apres ce nombre de points consecutifs abandonnes (7 essais chacun), l'API est consideree saturee :
-    // on s'arrete (le cache est conserve) plutot que d'attendre plus d'une heure pour rien.
-    maxConsecutiveFailures: 4,
+    // Marge (km) autour du departement dans la zone demandee : les communes du bord gardent leur maille.
+    marginKm: 4,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--output-dir") args.outputDir = argv[++i];
     else if (a === "--current-metadata-url") args.currentMetadataUrl = argv[++i];
     else if (a === "--force") args.force = true;
-    else if (a === "--grid-spacing-deg") args.gridSpacingDeg = Number(argv[++i]);
-    else if (a === "--max-points") args.maxPoints = Number(argv[++i]);
-    else if (a === "--concurrency") args.concurrency = Number(argv[++i]);
-    else if (a === "--pacing-ms") args.pacingMs = Number(argv[++i]);
     else if (a === "--cache-dir") args.cacheDir = argv[++i];
-    else if (a === "--max-consecutive-failures") args.maxConsecutiveFailures = Number(argv[++i]);
+    else if (a === "--margin-km") args.marginKm = Number(argv[++i]);
     else throw new Error(`Argument inconnu : ${a}`);
   }
   return args;
@@ -146,22 +137,29 @@ function sleep(ms) {
 
 // Requete HTTP polie : backoff exponentiel a partir de ~2.5s, plafonne a
 // ~30s d'attente entre essais, abandon propre apres `maxAttempts`.
+// Seuls les 429 / 5xx et les coupures reseau sont reessayes ; une autre erreur HTTP (400, 404, 406...) est definitive.
 async function fetchWithRetry(url, { maxAttempts = 7, baseDelayMs = 2500, maxDelayMs = 30000 } = {}) {
   let lastError;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    let response;
     try {
-      const response = await fetch(url, { headers: { "User-Agent": USER_AGENT, Accept: "application/json" } });
+      // Le /cube repond en CoverageJSON (application/prs.coverage+json) : un Accept limite a application/json
+      // lui fait renvoyer 406 "Could not find acceptable representation".
+      response = await fetch(url, {
+        headers: { "User-Agent": USER_AGENT, Accept: "application/prs.coverage+json, application/json;q=0.9, */*;q=0.1" },
+      });
       if (response.status === 200) {
-        return response.json();
-      }
-      if (response.status === 429 || response.status >= 500) {
-        lastError = new Error(`HTTP ${response.status} (${await response.text().catch(() => "")})`);
-      } else {
-        const body = await response.text().catch(() => "");
-        throw new Error(`HTTP ${response.status} sur ${url} : ${body.slice(0, 300)}`);
+        return await response.json();
       }
     } catch (error) {
       lastError = error;
+    }
+    if (response && response.status !== 200) {
+      const body = await response.text().catch(() => "");
+      if (response.status !== 429 && response.status < 500) {
+        throw new Error(`HTTP ${response.status} sur ${url} : ${body.slice(0, 300)}`);
+      }
+      lastError = new Error(`HTTP ${response.status} (${body.slice(0, 200)})`);
     }
     if (attempt < maxAttempts) {
       const delay = Math.min(maxDelayMs, baseDelayMs * 2 ** (attempt - 1));
@@ -198,84 +196,53 @@ async function alreadyPublished(url, runTime) {
   }
 }
 
-// --- Geometrie : point-in-polygon (ray casting) + grille reguliere ---
+// --- Projection native DINI (WKT de la collection : "DMI HARMONIE DINI lambert projection") ---
+// Lambert conique conforme tangent a 55,5 N, meridien d'origine -8, sphere de rayon 6 371 229 m, origine (0, 0).
+// Le /cube attend et renvoie des coordonnees en KILOMETRES (grille 1906 x 1606, pas de 2 km). Verifie : le point
+// de grille renvoye par /position pour Perpignan tombe exactement sur un noeud du /cube.
+const LCC_R = 6371229;
+const LCC_PHI1 = (55.5 * Math.PI) / 180;
+const LCC_LAMBDA0 = (-8 * Math.PI) / 180;
+const LCC_N = Math.sin(LCC_PHI1);
+const LCC_F = (Math.cos(LCC_PHI1) * Math.tan(Math.PI / 4 + LCC_PHI1 / 2) ** LCC_N) / LCC_N;
+const lccRho = (phi) => (LCC_R * LCC_F) / Math.tan(Math.PI / 4 + phi / 2) ** LCC_N;
+const LCC_RHO0 = lccRho(LCC_PHI1);
 
-function pointInRing(lon, lat, ring) {
-  let inside = false;
-  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
-    const [xi, yi] = ring[i];
-    const [xj, yj] = ring[j];
-    const intersects = yi > lat !== yj > lat && lon < ((xj - xi) * (lat - yi)) / (yj - yi) + xi;
-    if (intersects) inside = !inside;
-  }
-  return inside;
+function versLambert(lon, lat) {
+  const rho = lccRho((lat * Math.PI) / 180);
+  const theta = LCC_N * ((lon * Math.PI) / 180 - LCC_LAMBDA0);
+  return [(rho * Math.sin(theta)) / 1000, (LCC_RHO0 - rho * Math.cos(theta)) / 1000];
 }
 
-function pointInPolygon(lon, lat, polygonCoordinates) {
-  // GeoJSON Polygon : [outerRing, hole1, hole2, ...]. On ignore les trous
-  // (aucun departement francais n'en a).
-  if (!polygonCoordinates.length) return false;
-  return pointInRing(lon, lat, polygonCoordinates[0]);
+function versLonLat(xKm, yKm) {
+  const x = xKm * 1000;
+  const y = yKm * 1000;
+  const rho = Math.hypot(x, LCC_RHO0 - y);
+  const theta = Math.atan2(x, LCC_RHO0 - y);
+  const lon = ((theta / LCC_N + LCC_LAMBDA0) * 180) / Math.PI;
+  const lat = ((2 * Math.atan(((LCC_R * LCC_F) / rho) ** (1 / LCC_N)) - Math.PI / 2) * 180) / Math.PI;
+  return [lon, lat];
 }
 
-function distancePointToSegmentKm(lon, lat, [x1, y1], [x2, y2]) {
-  // Approximation planaire suffisante a l'echelle d'un departement.
-  const kx = 82; // km par degre de longitude a ~42.6N
-  const ky = 111; // km par degre de latitude
-  const px = lon * kx;
-  const py = lat * ky;
-  const ax = x1 * kx;
-  const ay = y1 * ky;
-  const bx = x2 * kx;
-  const by = y2 * ky;
-  const dx = bx - ax;
-  const dy = by - ay;
-  const lengthSq = dx * dx + dy * dy;
-  let t = lengthSq === 0 ? 0 : ((px - ax) * dx + (py - ay) * dy) / lengthSq;
-  t = Math.max(0, Math.min(1, t));
-  const cx = ax + t * dx;
-  const cy = ay + t * dy;
-  return Math.hypot(px - cx, py - cy);
+// Composantes u/v du vent : relatives aux axes de la grille Lambert (convention GRIB des grilles coniques). La
+// direction vraie s'en deduit en ajoutant l'angle de convergence des meridiens, n x (lon - lon0) : ~8,6 degres a
+// Perpignan. Mettre VENT_UV_RELATIF_GRILLE a false si le DMI publie un jour des composantes deja orientees au nord.
+const VENT_UV_RELATIF_GRILLE = true;
+
+function ventDepuisUV(u, v, lon) {
+  if (typeof u !== "number" || typeof v !== "number") return { vitesse: null, direction: null };
+  const rotation = VENT_UV_RELATIF_GRILLE ? (LCC_N * (lon * Math.PI) / 180 - LCC_N * LCC_LAMBDA0) * (180 / Math.PI) : 0;
+  // Direction meteorologique : d'ou vient le vent, en degres depuis le nord, sens horaire.
+  const directionGrille = (Math.atan2(-u, -v) * 180) / Math.PI;
+  return { vitesse: Math.hypot(u, v), direction: (((directionGrille + rotation) % 360) + 360) % 360 };
 }
 
-function distanceToPolygonBoundaryKm(lon, lat, ring) {
-  let best = Infinity;
-  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
-    best = Math.min(best, distancePointToSegmentKm(lon, lat, ring[j], ring[i]));
-  }
-  return best;
-}
-
-function haversineKm(lon1, lat1, lon2, lat2) {
-  const R = 6371;
-  const toRad = (d) => (d * Math.PI) / 180;
-  const dLat = toRad(lat2 - lat1);
-  const dLon = toRad(lon2 - lon1);
-  const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
-  return 2 * R * Math.asin(Math.sqrt(a));
-}
-
-function buildGrid(polygonCoordinates, spacingDeg, bufferKm = 4) {
-  const ring = polygonCoordinates[0];
-  const lons = ring.map((c) => c[0]);
-  const lats = ring.map((c) => c[1]);
-  const minLon = Math.min(...lons);
-  const maxLon = Math.max(...lons);
-  const minLat = Math.min(...lats);
-  const maxLat = Math.max(...lats);
-  const lonStep = spacingDeg * 1.35; // compense la contraction est-ouest a cette latitude
-  const latStep = spacingDeg;
-  const points = [];
-  for (let lat = minLat; lat <= maxLat + latStep / 2; lat += latStep) {
-    for (let lon = minLon; lon <= maxLon + lonStep / 2; lon += lonStep) {
-      const inside = pointInPolygon(lon, lat, polygonCoordinates);
-      const nearBoundary = !inside && distanceToPolygonBoundaryKm(lon, lat, ring) <= bufferKm;
-      if (inside || nearBoundary) {
-        points.push([Number(lon.toFixed(5)), Number(lat.toFixed(5))]);
-      }
-    }
-  }
-  return points;
+// Zone native (km) couvrant le departement, plus une marge.
+function bboxNative(ring, marginKm) {
+  const xy = ring.map(([lon, lat]) => versLambert(lon, lat));
+  const xs = xy.map((p) => p[0]);
+  const ys = xy.map((p) => p[1]);
+  return [Math.min(...xs) - marginKm, Math.min(...ys) - marginKm, Math.max(...xs) + marginKm, Math.max(...ys) + marginKm];
 }
 
 // --- Traitement des reponses DMI ---
@@ -306,26 +273,33 @@ function computeConditionCode({ precipMm, snowMm, precipType, cloudPct, visKm, w
   return 1; // degage
 }
 
-async function fetchPoint(lon, lat, pacingMs = 0) {
-  let times = null;
-  const series = {};
-  for (let b = 0; b < DMI_PARAMETER_BATCHES.length; b++) {
-    const batch = DMI_PARAMETER_BATCHES[b];
-    const url = `${API_BASE}/position?coords=${encodeURIComponent(`POINT(${lon} ${lat})`)}&parameter-name=${batch.join(",")}&crs=crs84`;
-    const coverage = await fetchWithRetry(url);
-    const batchTimes = coverage.domain?.axes?.t?.values;
-    if (!batchTimes || !batchTimes.length) throw new Error(`Reponse DMI sans axe temporel pour ${lon},${lat}`);
-    if (times === null) {
-      times = batchTimes;
-    } else if (batchTimes.length !== times.length || batchTimes[0] !== times[0]) {
-      throw new Error(`Echeances incoherentes entre lots de parametres pour ${lon},${lat}`);
-    }
-    for (const param of batch) {
-      series[param] = toCoverageIndex(coverage, param) || new Array(batchTimes.length).fill(null);
-    }
-    if (pacingMs > 0 && b < DMI_PARAMETER_BATCHES.length - 1) await sleep(pacingMs);
-  }
+// Axe regulier CoverageJSON ({start, stop, num}) ou liste de valeurs -> liste de valeurs.
+function valeursAxe(axe) {
+  if (Array.isArray(axe.values)) return axe.values;
+  if (axe.num === 1) return [axe.start];
+  return Array.from({ length: axe.num }, (_, i) => axe.start + ((axe.stop - axe.start) * i) / (axe.num - 1));
+}
 
+// Un lot de parametres pour toute la zone : { times, xs, ys, ranges } (valeurs a plat, axes [t, y, x]).
+async function fetchCube(bbox, batch) {
+  const url = `${API_BASE}/cube?bbox=${bbox.map((v) => v.toFixed(3)).join(",")}&crs=native&parameter-name=${batch.join(",")}`;
+  // Saturation frequente : beaucoup de patience (2 requetes seulement par run, ~30-60 s chacune cote DMI).
+  const coverage = await fetchWithRetry(url, { maxAttempts: 14, baseDelayMs: 5000, maxDelayMs: 60000 });
+  const axes = coverage.domain?.axes;
+  if (!axes?.t || !axes?.x || !axes?.y) throw new Error("Reponse /cube DMI sans axes t, x, y");
+  const ranges = {};
+  for (const param of batch) {
+    const range = coverage.ranges?.[param];
+    if (!range) continue;
+    const ordre = (range.axisNames || []).join(",");
+    if (ordre !== "t,y,x") throw new Error(`Axes inattendus pour ${param} : ${ordre}`);
+    ranges[param] = range.values;
+  }
+  return { times: valeursAxe(axes.t), xs: valeursAxe(axes.x), ys: valeursAxe(axes.y), ranges };
+}
+
+// Lignes de sortie (VALUE_COLUMNS) d'une maille a partir de ses series par parametre.
+function construireLignes(times, series, lon) {
   const geopotential = series["geopotential"].find((v) => typeof v === "number");
   const altitudeM = typeof geopotential === "number" ? Math.round(geopotential / 9.80665) : 0;
 
@@ -336,8 +310,7 @@ async function fetchPoint(lon, lat, pacingMs = 0) {
     const tempK = series["temperature-2m"][i];
     const dewK = series["dew-point-temperature-2m"][i];
     const rh = series["relative-humidity-2m"][i];
-    const windMs = series["wind-speed-10m"][i];
-    const windDir = series["wind-dir-10m"][i];
+    const { vitesse: windMs, direction: windDir } = ventDepuisUV(series["wind-10m-u"][i], series["wind-10m-v"][i], lon);
     const gustMs = series["gust-wind-speed-10m"][i];
     const pressurePa = series["pressure-sealevel"][i];
     const visM = series["visibility"][i];
@@ -380,34 +353,7 @@ async function fetchPoint(lon, lat, pacingMs = 0) {
     rows.push(row);
   }
 
-  return { times, rows, altitudeM };
-}
-
-async function mapWithConcurrency(items, limit, worker) {
-  const results = new Array(items.length);
-  let cursor = 0;
-  async function runOne() {
-    while (cursor < items.length) {
-      const index = cursor++;
-      results[index] = await worker(items[index], index);
-    }
-  }
-  const workers = Array.from({ length: Math.min(limit, items.length) }, runOne);
-  await Promise.all(workers);
-  return results;
-}
-
-function nearestPointIndex(lon, lat, points) {
-  let best = 0;
-  let bestDist = Infinity;
-  for (let i = 0; i < points.length; i++) {
-    const d = haversineKm(lon, lat, points[i][0], points[i][1]);
-    if (d < bestDist) {
-      bestDist = d;
-      best = i;
-    }
-  }
-  return best;
+  return { rows, altitudeM };
 }
 
 async function main() {
@@ -429,110 +375,94 @@ async function main() {
   const communesRaw = JSON.parse(await readFile(path.join(ROOT, "config", "communes-66.json"), "utf-8"));
   const communeColumns = communesRaw.columns; // code_insee,name,postal_codes,population,latitude,longitude
 
-  log("Construction de la grille de points sur le departement 66...");
-  let gridPoints = buildGrid(polygonCoordinates, args.gridSpacingDeg);
-  if (gridPoints.length > args.maxPoints) {
-    // Elargit le pas jusqu'a repasser sous la limite plutot que de tronquer
-    // arbitrairement la grille.
-    let spacing = args.gridSpacingDeg;
-    while (gridPoints.length > args.maxPoints) {
-      spacing *= 1.15;
-      gridPoints = buildGrid(polygonCoordinates, spacing);
-    }
-  }
-  log(`Grille retenue : ${gridPoints.length} points (~${args.gridSpacingDeg.toFixed(3)}deg de pas).`);
+  const bbox = bboxNative(polygonCoordinates[0], args.marginKm);
+  log(`Zone native demandee (km) : ${bbox.map((v) => v.toFixed(1)).join(", ")}`);
 
-  log(`Interrogation du DMI pour ${gridPoints.length} points (endpoint /position, ${DMI_PARAMETERS.length} parametres)...`);
-  const startedAt = Date.now();
-  let failedCount = 0;
-
-  // Cache des points deja recuperes pour CE run (identifie par l'instance DMI).
-  const cacheFile = path.join(args.cacheDir, "points.json");
-  let cache = { instanceId, points: {} };
+  // Cache des lots deja recuperes pour CE run (identifie par l'instance DMI).
+  const cacheFile = path.join(args.cacheDir, "cubes.json");
+  let cache = { instanceId, lots: {} };
   try {
     const saved = JSON.parse(await readFile(cacheFile, "utf-8"));
-    if (saved.instanceId === instanceId && saved.points) cache = saved;
+    if (saved.instanceId === instanceId && saved.lots) cache = saved;
   } catch {
     // pas de cache : premiere tentative pour ce run
   }
   await mkdir(args.cacheDir, { recursive: true });
-  const cachedAtStart = Object.keys(cache.points).length;
-  if (cachedAtStart) log(`Cache : ${cachedAtStart} point(s) deja recupere(s) pour ce run, ils ne sont pas redemandes.`);
-  let consecutiveFailures = 0;
 
-  const fetchedRaw = await mapWithConcurrency(gridPoints, args.concurrency, async ([lon, lat], i) => {
-    const key = `${lon},${lat}`;
-    if (cache.points[key]) return cache.points[key];
-    if (consecutiveFailures >= args.maxConsecutiveFailures) {
-      failedCount++;
-      return null;
-    }
-    try {
-      const result = await fetchPoint(lon, lat, args.pacingMs);
-      consecutiveFailures = 0;
-      cache.points[key] = result;
+  const startedAt = Date.now();
+  const lots = [];
+  for (let b = 0; b < DMI_PARAMETER_BATCHES.length; b++) {
+    if (cache.lots[b]) {
+      log(`Lot ${b + 1}/${DMI_PARAMETER_BATCHES.length} : deja en cache pour ce run.`);
+    } else {
+      log(`Lot ${b + 1}/${DMI_PARAMETER_BATCHES.length} : /cube (${DMI_PARAMETER_BATCHES[b].length} parametres)...`);
+      cache.lots[b] = await fetchCube(bbox, DMI_PARAMETER_BATCHES[b]);
       await writeFile(cacheFile, JSON.stringify(cache), "utf-8");
-      if (args.pacingMs > 0) await sleep(args.pacingMs);
-      if ((i + 1) % 20 === 0 || i === gridPoints.length - 1) {
-        log(`  ${i + 1}/${gridPoints.length} points traites (${failedCount} echecs jusqu'ici)...`);
-      }
-      return result;
-    } catch (error) {
-      failedCount++;
-      consecutiveFailures++;
-      log(`  Point ${i} (${lon},${lat}) abandonne apres tous les essais : ${error.message.slice(0, 160)}`);
-      if (consecutiveFailures >= args.maxConsecutiveFailures) {
-        log(`  ${consecutiveFailures} points de suite en echec : API DMI saturee, arret (les points deja recuperes sont conserves pour le prochain passage).`);
-      }
-      return null;
     }
-  });
-  log(`Recuperation terminee en ${((Date.now() - startedAt) / 1000).toFixed(0)}s (${failedCount}/${gridPoints.length} points en echec).`);
-
-  // Un jeu partiel (>= 40 % des points) vaut mieux qu'un run ancien : les communes des points manquants
-  // reprennent le point le plus proche (nearestPointIndex ci-dessous). En dessous, le DMI est vraiment HS.
-  if (failedCount > gridPoints.length * 0.6) {
-    throw new Error(
-      `Trop de points en echec (${failedCount}/${gridPoints.length}) - le DMI semble indisponible, abandon plutot que de publier un jeu de donnees trop incomplet.`
-    );
+    lots.push(cache.lots[b]);
   }
-  if (failedCount > 0) log(`Publication partielle : ${gridPoints.length - failedCount}/${gridPoints.length} points recuperes.`);
+  log(`Recuperation terminee en ${((Date.now() - startedAt) / 1000).toFixed(0)}s.`);
 
-  // On ne conserve que les points effectivement recuperes, et on
-  // renumerote model_index en consequence (0..n-1 dans l'ordre conserve).
-  const okGridPoints = [];
-  const fetched = [];
-  gridPoints.forEach((gp, i) => {
-    if (fetchedRaw[i] !== null) {
-      okGridPoints.push(gp);
-      fetched.push(fetchedRaw[i]);
+  const { times: canonicalTimes, xs, ys } = lots[0];
+  for (const lot of lots) {
+    if (lot.times.length !== canonicalTimes.length || lot.times[0] !== canonicalTimes[0]) {
+      throw new Error("Echeances incoherentes entre lots de parametres DMI");
     }
-  });
-  if (!fetched.length) throw new Error("Aucun point recupere avec succes.");
-
-  const canonicalTimes = fetched[0].times;
-  for (const f of fetched) {
-    if (f.times.length !== canonicalTimes.length) {
-      throw new Error("Nombre d'echeances incoherent entre points DMI (reponse partielle ?)");
+    if (lot.xs.length !== xs.length || lot.ys.length !== ys.length || lot.xs[0] !== xs[0] || lot.ys[0] !== ys[0]) {
+      throw new Error("Grilles incoherentes entre lots de parametres DMI");
     }
   }
+  const nx = xs.length;
+  const ny = ys.length;
+  const nt = canonicalTimes.length;
+  const pasX = nx > 1 ? (xs[nx - 1] - xs[0]) / (nx - 1) : 2;
+  const pasY = ny > 1 ? (ys[ny - 1] - ys[0]) / (ny - 1) : 2;
+  log(`Grille DMI : ${nx} x ${ny} mailles (pas ${pasX.toFixed(2)} x ${pasY.toFixed(2)} km), ${nt} echeances.`);
 
-  const points = okGridPoints.map(([lon, lat], i) => [i, lat, lon, fetched[i].altitudeM]);
-
-  const communes = communesRaw.communes.map((c) => {
-    const lat = c[communeColumns.indexOf("latitude")];
-    const lon = c[communeColumns.indexOf("longitude")];
-    const pointId = nearestPointIndex(lon, lat, okGridPoints);
-    return [
-      c[communeColumns.indexOf("code_insee")],
-      c[communeColumns.indexOf("name")],
-      c[communeColumns.indexOf("postal_codes")],
-      c[communeColumns.indexOf("population")],
-      lat,
-      lon,
-      pointId,
-    ];
+  // Chaque commune prend la maille native qui la contient ; une maille partagee n'est publiee qu'une fois.
+  const mailles = new Map(); // "i,j" -> index du point publie
+  const pointsIJ = [];
+  const communeMaille = communesRaw.communes.map((c) => {
+    const [x, y] = versLambert(c[communeColumns.indexOf("longitude")], c[communeColumns.indexOf("latitude")]);
+    const i = Math.min(nx - 1, Math.max(0, Math.round((x - xs[0]) / pasX)));
+    const j = Math.min(ny - 1, Math.max(0, Math.round((y - ys[0]) / pasY)));
+    const cle = `${i},${j}`;
+    if (!mailles.has(cle)) {
+      mailles.set(cle, pointsIJ.length);
+      pointsIJ.push([i, j]);
+    }
+    return mailles.get(cle);
   });
+
+  const fetched = pointsIJ.map(([i, j]) => {
+    const series = {};
+    for (let b = 0; b < DMI_PARAMETER_BATCHES.length; b++) {
+      for (const param of DMI_PARAMETER_BATCHES[b]) {
+        const valeurs = lots[b].ranges[param];
+        series[param] = Array.from({ length: nt }, (_, t) => {
+          const v = valeurs ? valeurs[t * ny * nx + j * nx + i] : null;
+          return typeof v === "number" ? v : null;
+        });
+      }
+    }
+    return construireLignes(canonicalTimes, series, versLonLat(xs[i], ys[j])[0]);
+  });
+  if (!fetched.length) throw new Error("Aucune maille DMI retenue.");
+
+  const points = pointsIJ.map(([i, j], k) => {
+    const [lon, lat] = versLonLat(xs[i], ys[j]);
+    return [k, Number(lat.toFixed(5)), Number(lon.toFixed(5)), fetched[k].altitudeM];
+  });
+
+  const communes = communesRaw.communes.map((c, k) => [
+    c[communeColumns.indexOf("code_insee")],
+    c[communeColumns.indexOf("name")],
+    c[communeColumns.indexOf("postal_codes")],
+    c[communeColumns.indexOf("population")],
+    c[communeColumns.indexOf("latitude")],
+    c[communeColumns.indexOf("longitude")],
+    communeMaille[k],
+  ]);
 
   const forecast = canonicalTimes.map((iso, i) => [iso, fetched.map((f) => f.rows[i])]);
 

@@ -27,11 +27,11 @@ concurrency:
 jobs:
   update:
     runs-on: ubuntu-24.04
-    # L'API DMI est mutualisee et repond parfois "429 Server is busy" ; avec ~114 points en
-    # sequentiel (concurrency 1) et un budget de nouvelles tentatives poli (backoff jusqu'a 30s),
-    # une passe complete prend deja ~85 min meme SANS aucun echec (observe : 60/114 points en 45
-    # min, 0 echec, coupe par l'ancien timeout). 45 min etait donc trop court pour reussir une
-    # passe meme quand le DMI repond bien ; 120 min laisse la marge necessaire.
+    # Deux requetes /cube par run (toute la grille 2 km du 66), mais l'API DMI, mutualisee, repond
+    # souvent "429 Server is busy" pendant de longues periodes : chaque requete patiente jusqu'a
+    # ~12 min (14 essais, backoff jusqu'a 60 s) et la boucle ci-dessous fait jusqu'a 3 tentatives,
+    # le lot deja recupere restant en cache. Observe le 2026-10-15 : ~45 min de 429 puis 2 requetes
+    # reussies en ~1 min. 120 min laisse la marge necessaire.
     timeout-minutes: 120
 
     steps:
